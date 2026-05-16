@@ -6,8 +6,9 @@ Inspired by the old Windows Media Player visualizers (especially WhiteCap), but 
 
 ## Features
 
-- **System-wide audio capture** via Windows WASAPI loopback — visualizes whatever your default output device is playing, regardless of source app.
+- **System-wide *or* per-app audio capture** via Windows WASAPI loopback. Pick "System (all audio)" to visualize everything, or pick a specific app (Spotify, Chrome, Discord, etc.) to react only to that app's output.
 - **3D audio-reactive visualizer** — a spectrum-driven spike ball rendered in WebGL2. 600 rays radiate in 3D, each ray's length tied to one frequency bin. Bass kicks make the whole ball "breathe" outward; treble drives sparkle; the camera slowly orbits.
+- **Now Playing overlay** — pulls track title, artist, album, art, and progress from Windows SMTC. Follows the source picker — picking Spotify shows Spotify's track; picking Chrome shows the Chrome tab's title.
 - **Real-time spectrum analysis** — 1024-point FFT at 48 kHz, ~90 frames/second updates.
 - **Small footprint** — ~10 MB executable, Tauri-based (Rust backend + Svelte frontend + Edge WebView2).
 
@@ -15,8 +16,8 @@ Inspired by the old Windows Media Player visualizers (especially WhiteCap), but 
 
 Grab the latest installer from the [Releases](../../releases) page:
 
-- **`wmp-modern_0.1.0_x64-setup.exe`** — NSIS installer. Installs per-user (no admin required). Recommended.
-- **`wmp-modern_0.1.0_x64_en-US.msi`** — MSI installer. Installs system-wide (requires admin).
+- **`wmp-modern_<version>_x64-setup.exe`** — NSIS installer. Installs per-user (no admin required). Recommended.
+- **`wmp-modern_<version>_x64_en-US.msi`** — MSI installer. Installs system-wide (requires admin).
 
 ### Heads-up: Windows SmartScreen warning
 
@@ -34,7 +35,22 @@ If you have **Smart App Control** enabled (a stricter Windows 11 feature), unsig
 Launch the app — it auto-starts audio capture. Play music in any app (Spotify, browser, etc.) and the visualizer reacts.
 
 - **F** — toggle fullscreen
-- The HUD auto-hides after 3s; move the mouse to bring it back.
+- **Source dropdown** (top-right HUD) — pick which app to capture from. Selection persists across launches.
+- The HUD and Now Playing card auto-hide after 3s; move the mouse to bring them back.
+
+### App compatibility for Now Playing
+
+The Now Playing overlay reads from Windows SMTC (System Media Transport Controls). What you get depends on how well each app publishes there:
+
+| App | Title / Artist | Album art | Position / duration |
+|---|---|---|---|
+| Spotify (desktop) | ✅ | ✅ | ✅ |
+| Edge (YouTube, YT Music) | ✅ | ✅ | ✅ |
+| Groove, Films & TV | ✅ | ✅ | ✅ |
+| Chrome (YouTube) | ✅ | ✅ | ⚠️ flaky — Chrome's SMTC implementation often reports stale or zero positions |
+| VLC, foobar, MPC-HC | depends on settings | depends | depends |
+
+If an app doesn't publish to SMTC at all, the Now Playing card simply doesn't appear — the visualizer still works.
 
 ## Build from source
 
@@ -70,9 +86,10 @@ npm run tauri build    # produce installers in src-tauri/target/release/bundle/
 
 ## Roadmap
 
-- **v0.1** *(current)* — system-wide audio capture, spike-ball visualizer.
-- **v0.2** — per-app audio picker (capture only Spotify, only Chrome, etc.) via `IAudioClient`'s per-process loopback mode.
-- *Future ideas* — multiple visualizer presets, palette customization, fullscreen on launch flag.
+- **v0.1** — system-wide audio capture + spike-ball visualizer.
+- **v0.2** — per-app audio picker via `IAudioClient`'s per-process loopback mode.
+- **v0.3** *(current)* — Now Playing overlay via SMTC, coupled to the source picker.
+- *Future ideas* — multiple visualizer presets (preset cycler in the HUD), palette customization, fullscreen-on-launch flag, beat-synced preset transitions.
 
 ## License
 

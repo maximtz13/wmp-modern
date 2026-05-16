@@ -37,8 +37,31 @@
   let sessions = $state<AudioSession[]>([]);
   let selectedPid = $state<number | null>(null);
   let refreshing = $state(false);
+  let sourceOpen = $state(false);
+  let sourceDdEl: HTMLDivElement | undefined;
 
   const LS_KEY = "wmp-modern.selectedPid";
+
+  // ─── Now Playing (SMTC) ───────────────────────────────────────────
+  type NowPlaying = {
+    title: string;
+    artist: string;
+    album: string;
+    status: string;
+    position_ms: number;
+    duration_ms: number;
+    playback_rate: number;
+    last_updated_unix_ms: number;
+    source_app: string;
+    thumbnail: string | null;
+  };
+
+  let nowPlaying = $state<NowPlaying | null>(null);
+  // Local-clock snapshot of when we observed the last position, so the progress bar
+  // can drift forward smoothly between polls without waiting for the next 1s tick.
+  let npObservedAt = 0;
+  let npPollTimer: number | undefined;
+  let displayPos = $state(0);
 
   onMount(async () => {
     try { initGL(canvasEl); } catch (e) { error = String(e); return; }
@@ -51,10 +74,15 @@
     await refreshSessions();
     await startWithSelected();
 
+    // Start Now Playing polling.
+    pollNowPlaying(); // immediate
+    npPollTimer = window.setInterval(pollNowPlaying, 1000);
+
     bumpHud();
     window.addEventListener("mousemove", bumpHud);
     window.addEventListener("keydown", onKey);
     window.addEventListener("resize", resize);
+    window.addEventListener("click", onWindowClick);
   });
 
   async function refreshSessions() {
@@ -74,6 +102,12 @@
     if (selectedPid !== null && !sessions.some((s) => s.pid === selectedPid)) {
       selectedPid = null;
     }
+    // Keep the SMTC card in sync with the audio source. Passing the exe name so
+    // the backend can find the matching SMTC session via AUMID.
+    const targetExe = selectedPid === null
+      ? null
+      : (sessions.find((s) => s.pid === selectedPid)?.exe ?? null);
+    try { await invoke("set_smtc_target_exe", { exe: targetExe }); } catch {}
     try {
       await invoke("start_capture", { pid: selectedPid });
       running = true;
@@ -94,20 +128,72 @@
     }
   }
 
-  async function onSourceChange(e: Event) {
-    const v = (e.currentTarget as HTMLSelectElement).value;
-    selectedPid = v === "" ? null : Number(v);
-    localStorage.setItem(LS_KEY, v);
+  async function selectSource(pid: number | null) {
+    selectedPid = pid;
+    localStorage.setItem(LS_KEY, pid === null ? "" : String(pid));
+    sourceOpen = false;
     try { await invoke("stop_capture"); } catch {}
     running = false;
     await startWithSelected();
   }
+
+  function onWindowClick(e: MouseEvent) {
+    if (sourceOpen && sourceDdEl && !sourceDdEl.contains(e.target as Node)) {
+      sourceOpen = false;
+    }
+  }
+
+  type NowPlayingSnapshot = {
+    current: NowPlaying | null;
+    error: string | null;
+    poll_age_ms: number;
+  };
+
+  async function pollNowPlaying() {
+    try {
+      const snap = await invoke<NowPlayingSnapshot>("get_now_playing");
+      if (snap.current && (snap.current.title || snap.current.artist)) {
+        nowPlaying = snap.current;
+        npObservedAt = performance.now();
+        displayPos = snap.current.position_ms;
+      } else {
+        nowPlaying = null;
+      }
+    } catch {
+      nowPlaying = null;
+    }
+  }
+
+  function fmtTime(ms: number): string {
+    if (!isFinite(ms) || ms < 0) return "0:00";
+    const s = Math.floor(ms / 1000);
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return `${m}:${r.toString().padStart(2, "0")}`;
+  }
+
+  function prettySource(aumid: string): string {
+    // AUMIDs come in two flavors:
+    //   - Desktop: "Spotify.exe", "chrome.exe", "discord.exe"
+    //   - UWP/MSIX: "Microsoft.Edge_8wekyb3d8bbwe!App", "Spotify..._zpdnekdrzrea0!Spotify"
+    // Strip the "!AppEntry" suffix, the ".exe" suffix, the "_publisherhash" segment,
+    // then return the last dot-separated piece.
+    if (!aumid) return "";
+    let s = aumid.split("!")[0];
+    if (s.toLowerCase().endsWith(".exe")) s = s.slice(0, -4);
+    s = s.split("_")[0];                   // strip publisher hash on UWP names
+    const parts = s.split(".");
+    return parts[parts.length - 1] || s;
+  }
+
   onDestroy(() => {
     unlisten?.();
     cancelAnimationFrame(rafId);
+    if (npPollTimer) clearInterval(npPollTimer);
     window.removeEventListener("mousemove", bumpHud);
     window.removeEventListener("keydown", onKey);
     window.removeEventListener("resize", resize);
+    window.removeEventListener("click", onWindowClick);
     if (hudTimer) clearTimeout(hudTimer);
   });
 
@@ -485,6 +571,13 @@
     // Kick envelope decay.
     kickEnv *= Math.pow(0.04, dt);
 
+    // Smooth Now Playing position interpolation between polls.
+    if (nowPlaying && nowPlaying.status === "playing") {
+      const elapsed = now - npObservedAt;
+      const extrapolated = nowPlaying.position_ms + elapsed * nowPlaying.playback_rate;
+      displayPos = Math.min(nowPlaying.duration_ms || extrapolated, extrapolated);
+    }
+
     // Trail fade.
     gl.bindVertexArray(quadVao);
     gl.useProgram(quadProgram);
@@ -525,23 +618,73 @@
 
 <canvas bind:this={canvasEl}></canvas>
 
+{#if nowPlaying && (nowPlaying.title || nowPlaying.artist)}
+  <div class="np" class:hidden={!showHud}>
+    {#if nowPlaying.thumbnail}
+      <img class="np-art" src={nowPlaying.thumbnail} alt="" />
+    {:else}
+      <div class="np-art np-art-placeholder">♪</div>
+    {/if}
+    <div class="np-text">
+      <div class="np-title" title={nowPlaying.title}>{nowPlaying.title || "Unknown"}</div>
+      <div class="np-artist" title={nowPlaying.artist}>
+        {nowPlaying.artist}{nowPlaying.album ? ` — ${nowPlaying.album}` : ""}
+      </div>
+      {#if nowPlaying.duration_ms > 0}
+        <div class="np-progress-row">
+          <span class="np-time">{fmtTime(displayPos)}</span>
+          <div class="np-progress">
+            <div class="np-progress-fill" style="width: {Math.min(100, (displayPos / nowPlaying.duration_ms) * 100)}%"></div>
+          </div>
+          <span class="np-time">{fmtTime(nowPlaying.duration_ms)}</span>
+        </div>
+      {/if}
+      <div class="np-status">
+        {nowPlaying.status === "playing" ? "▶" : nowPlaying.status === "paused" ? "⏸" : "■"}
+        <span class="np-source">{prettySource(nowPlaying.source_app)}</span>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <div class="hud" class:hidden={!showHud}>
   <div class="title">wmp-modern</div>
 
-  <label class="source">
+  <div class="source" bind:this={sourceDdEl}>
     <span class="label-text">Source</span>
-    <select value={selectedPid === null ? "" : String(selectedPid)} onchange={onSourceChange}>
-      <option value="">System (all audio)</option>
-      {#each sessions as s (s.pid)}
-        <option value={String(s.pid)} class:inactive={!s.is_active}>
-          {s.display}{s.is_active ? "" : " (idle)"}
-        </option>
-      {/each}
-    </select>
+    <div class="source-dd">
+      <button class="source-trigger" onclick={(e) => { e.stopPropagation(); sourceOpen = !sourceOpen; }}>
+        <span class="source-current">{
+          selectedPid === null
+            ? "System (all audio)"
+            : (sessions.find((s) => s.pid === selectedPid)?.display ?? "System (all audio)")
+        }</span>
+        <span class="chevron" class:open={sourceOpen}>▾</span>
+      </button>
+      {#if sourceOpen}
+        <div class="source-list">
+          <button
+            class="source-opt"
+            class:active={selectedPid === null}
+            onclick={() => selectSource(null)}>
+            System (all audio)
+          </button>
+          {#each sessions as s (s.pid)}
+            <button
+              class="source-opt"
+              class:active={selectedPid === s.pid}
+              class:idle={!s.is_active}
+              onclick={() => selectSource(s.pid)}>
+              {s.display}{s.is_active ? "" : " (idle)"}
+            </button>
+          {/each}
+        </div>
+      {/if}
+    </div>
     <button class="refresh" onclick={refreshSessions} disabled={refreshing} title="Refresh sources">
       {refreshing ? "…" : "↻"}
     </button>
-  </label>
+  </div>
 
   <div class="controls">
     {#if running}
@@ -572,19 +715,39 @@
   }
   .hud.hidden { opacity: 0; pointer-events: none; }
   .title { font-size: 0.9rem; font-weight: 500; margin-bottom: 0.4rem; }
-  .source { display: flex; gap: 0.4rem; align-items: center; margin-bottom: 0.5rem; flex-wrap: wrap; }
+  .source { display: flex; gap: 0.4rem; align-items: center; margin-bottom: 0.5rem; flex-wrap: nowrap; }
   .label-text { font-size: 0.75rem; color: #888; }
-  select {
-    /* color-scheme on the select itself ensures the OS-rendered dropdown list
-       uses dark colors even when something resets the page-level scheme. */
-    color-scheme: dark;
+  /* Custom dropdown — replaces native <select> because WebView2's option-list
+     rendering doesn't reliably respect color-scheme: dark. */
+  .source-dd { position: relative; flex: 1; min-width: 180px; max-width: 240px; }
+  .source-trigger {
+    width: 100%;
+    display: flex; justify-content: space-between; align-items: center; gap: 0.4rem;
     background: rgba(255,255,255,0.08); color: #eee; font: inherit; font-size: 0.8rem;
-    border: 1px solid rgba(255,255,255,0.15); border-radius: 5px; padding: 0.25rem 0.4rem;
-    min-width: 180px; max-width: 240px;
+    border: 1px solid rgba(255,255,255,0.15); border-radius: 5px;
+    padding: 0.25rem 0.5rem; cursor: pointer; text-align: left;
   }
-  /* Don't dim inactive options with custom colors — option elements in the OS-rendered
-     list ignore most CSS anyway, and a custom color clashes with the system theme.
-     We mark idle sessions with a "(idle)" suffix instead. */
+  .source-trigger:hover { background: rgba(255,255,255,0.14); }
+  .source-current { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chevron { font-size: 0.7rem; color: #aaa; transition: transform 0.15s ease; }
+  .chevron.open { transform: rotate(180deg); }
+  .source-list {
+    position: absolute; top: calc(100% + 4px); left: 0; right: 0;
+    background: rgba(18, 18, 22, 0.96); backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.12); border-radius: 6px;
+    padding: 0.2rem; z-index: 10;
+    max-height: 320px; overflow-y: auto;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+  }
+  .source-opt {
+    display: block; width: 100%; text-align: left;
+    background: transparent; color: #eee; font: inherit; font-size: 0.8rem;
+    border: none; border-radius: 4px; padding: 0.35rem 0.55rem; cursor: pointer;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .source-opt:hover { background: rgba(255,255,255,0.10); }
+  .source-opt.active { background: rgba(120, 160, 220, 0.22); color: #fff; }
+  .source-opt.idle { color: #888; }
   .refresh { padding: 0.25rem 0.55rem; font-size: 0.8rem; }
   .controls { display: flex; gap: 0.6rem; align-items: center; }
   button {
@@ -600,4 +763,52 @@
     background: rgba(255,255,255,0.1); padding: 0.05rem 0.3rem;
     border-radius: 3px; font-family: ui-monospace, monospace;
   }
+
+  /* ─── Now Playing card ────────────────────────────────────────── */
+  .np {
+    position: fixed; bottom: 1rem; left: 1rem;
+    display: flex; gap: 0.8rem; align-items: center;
+    padding: 0.7rem 0.9rem;
+    background: rgba(0,0,0,0.55); backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.08); border-radius: 10px;
+    max-width: min(440px, 50vw);
+    transition: opacity 0.4s ease;
+    user-select: none;
+  }
+  .np.hidden { opacity: 0; pointer-events: none; }
+  .np-art {
+    width: 64px; height: 64px; border-radius: 6px; flex-shrink: 0;
+    background: rgba(255,255,255,0.05); object-fit: cover;
+  }
+  .np-art-placeholder {
+    display: flex; align-items: center; justify-content: center;
+    color: rgba(255,255,255,0.4); font-size: 1.8rem;
+  }
+  .np-text { display: flex; flex-direction: column; gap: 0.2rem; min-width: 0; flex: 1; }
+  .np-title {
+    font-size: 0.95rem; font-weight: 500; color: #eee;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .np-artist {
+    font-size: 0.8rem; color: #aaa;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .np-progress-row {
+    display: flex; align-items: center; gap: 0.5rem; margin-top: 0.15rem;
+  }
+  .np-time {
+    font-size: 0.7rem; color: #888; font-variant-numeric: tabular-nums;
+    min-width: 2.5rem; text-align: right;
+  }
+  .np-time:first-child { text-align: right; }
+  .np-progress {
+    flex: 1; height: 3px; background: rgba(255,255,255,0.08); border-radius: 2px;
+    overflow: hidden;
+  }
+  .np-progress-fill {
+    height: 100%; background: linear-gradient(90deg, #888, #ccc);
+    transition: width 0.1s linear;
+  }
+  .np-status { font-size: 0.7rem; color: #777; display: flex; gap: 0.4rem; align-items: center; margin-top: 0.1rem; }
+  .np-source { color: #666; }
 </style>

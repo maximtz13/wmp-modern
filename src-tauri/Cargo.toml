@@ -1,6 +1,6 @@
 [package]
 name = "wmp-modern"
-version = "0.2.0"
+version = "0.3.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -26,5 +26,7 @@ wasapi = "0.23"
 rustfft = "6"
 anyhow = "1"
 parking_lot = "0.12"
-windows = { version = "0.62", features = ["Win32_System_Threading", "Win32_Foundation"] }
+windows = { version = "0.62", features = ["Win32_System_Threading", "Win32_Foundation", "Foundation", "Media_Control", "Storage_Streams"] }
+base64 = "0.22"
+pollster = "0.3"
 
