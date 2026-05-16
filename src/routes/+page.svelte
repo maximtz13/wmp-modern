@@ -16,6 +16,7 @@
 
   // ─── Audio state ──────────────────────────────────────────────────
   type SpectrumFrame = { bins: number[]; waveform: number[]; rms: number };
+  type AudioSession = { pid: number; exe: string; display: string; is_active: boolean };
 
   const bins = new Float32Array(N);
   const audio = { bass: 0, mid: 0, treble: 0, level: 0 };
@@ -32,16 +33,75 @@
   let hudTimer: number | undefined;
   let unlisten: UnlistenFn | undefined;
 
+  // Source picker: null = system-wide loopback; otherwise PID of a specific app.
+  let sessions = $state<AudioSession[]>([]);
+  let selectedPid = $state<number | null>(null);
+  let refreshing = $state(false);
+
+  const LS_KEY = "wmp-modern.selectedPid";
+
   onMount(async () => {
     try { initGL(canvasEl); } catch (e) { error = String(e); return; }
     unlisten = await listen<SpectrumFrame>("audio-spectrum", onFrame);
-    try { await invoke("start_capture"); running = true; }
-    catch (e) { error = String(e); }
+
+    // Restore last source choice (if any) from localStorage.
+    const stored = localStorage.getItem(LS_KEY);
+    selectedPid = stored !== null && stored !== "" ? Number(stored) : null;
+
+    await refreshSessions();
+    await startWithSelected();
+
     bumpHud();
     window.addEventListener("mousemove", bumpHud);
     window.addEventListener("keydown", onKey);
     window.addEventListener("resize", resize);
   });
+
+  async function refreshSessions() {
+    refreshing = true;
+    try {
+      sessions = await invoke<AudioSession[]>("list_audio_sessions");
+    } catch (e) {
+      error = String(e);
+    } finally {
+      refreshing = false;
+    }
+  }
+
+  async function startWithSelected() {
+    error = null;
+    // If the restored PID isn't present anymore, fall back to system.
+    if (selectedPid !== null && !sessions.some((s) => s.pid === selectedPid)) {
+      selectedPid = null;
+    }
+    try {
+      await invoke("start_capture", { pid: selectedPid });
+      running = true;
+    } catch (e) {
+      // If per-process capture fails (e.g. app exited between list and start), fall back.
+      if (selectedPid !== null) {
+        selectedPid = null;
+        try {
+          await invoke("start_capture", { pid: null });
+          running = true;
+          error = "Per-app capture failed, fell back to system audio.";
+        } catch (e2) {
+          error = String(e2);
+        }
+      } else {
+        error = String(e);
+      }
+    }
+  }
+
+  async function onSourceChange(e: Event) {
+    const v = (e.currentTarget as HTMLSelectElement).value;
+    selectedPid = v === "" ? null : Number(v);
+    localStorage.setItem(LS_KEY, v);
+    try { await invoke("stop_capture"); } catch {}
+    running = false;
+    await startWithSelected();
+  }
   onDestroy(() => {
     unlisten?.();
     cancelAnimationFrame(rafId);
@@ -93,9 +153,7 @@
     }
   }
   async function start() {
-    error = null;
-    try { await invoke("start_capture"); running = true; }
-    catch (e) { error = String(e); }
+    await startWithSelected();
   }
   async function stop() {
     try { await invoke("stop_capture"); } catch {}
@@ -469,6 +527,22 @@
 
 <div class="hud" class:hidden={!showHud}>
   <div class="title">wmp-modern</div>
+
+  <label class="source">
+    <span class="label-text">Source</span>
+    <select value={selectedPid === null ? "" : String(selectedPid)} onchange={onSourceChange}>
+      <option value="">System (all audio)</option>
+      {#each sessions as s (s.pid)}
+        <option value={String(s.pid)} class:inactive={!s.is_active}>
+          {s.display}{s.is_active ? "" : " (idle)"}
+        </option>
+      {/each}
+    </select>
+    <button class="refresh" onclick={refreshSessions} disabled={refreshing} title="Refresh sources">
+      {refreshing ? "…" : "↻"}
+    </button>
+  </label>
+
   <div class="controls">
     {#if running}
       <button onclick={stop}>Stop</button>
@@ -482,8 +556,11 @@
 </div>
 
 <style>
-  :global(html), :global(body) { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #000; }
-  :global(body) { font-family: ui-sans-serif, system-ui, sans-serif; color: #eee; }
+  /* color-scheme: dark tells the OS/browser to render native form controls (e.g. the
+     opened <option> list rendered by the OS) using dark default colors. Without this,
+     opened dropdowns appear as light text on white because the OS picks light theme. */
+  :global(html) { color-scheme: dark; margin: 0; padding: 0; height: 100%; overflow: hidden; background: #000; }
+  :global(body) { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #000; font-family: ui-sans-serif, system-ui, sans-serif; color: #eee; }
 
   canvas { display: block; position: fixed; inset: 0; width: 100vw; height: 100vh; }
 
@@ -495,6 +572,20 @@
   }
   .hud.hidden { opacity: 0; pointer-events: none; }
   .title { font-size: 0.9rem; font-weight: 500; margin-bottom: 0.4rem; }
+  .source { display: flex; gap: 0.4rem; align-items: center; margin-bottom: 0.5rem; flex-wrap: wrap; }
+  .label-text { font-size: 0.75rem; color: #888; }
+  select {
+    /* color-scheme on the select itself ensures the OS-rendered dropdown list
+       uses dark colors even when something resets the page-level scheme. */
+    color-scheme: dark;
+    background: rgba(255,255,255,0.08); color: #eee; font: inherit; font-size: 0.8rem;
+    border: 1px solid rgba(255,255,255,0.15); border-radius: 5px; padding: 0.25rem 0.4rem;
+    min-width: 180px; max-width: 240px;
+  }
+  /* Don't dim inactive options with custom colors — option elements in the OS-rendered
+     list ignore most CSS anyway, and a custom color clashes with the system theme.
+     We mark idle sessions with a "(idle)" suffix instead. */
+  .refresh { padding: 0.25rem 0.55rem; font-size: 0.8rem; }
   .controls { display: flex; gap: 0.6rem; align-items: center; }
   button {
     padding: 0.35rem 0.8rem; font: inherit; font-size: 0.85rem;

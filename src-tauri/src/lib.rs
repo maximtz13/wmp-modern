@@ -8,6 +8,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             audio::start_capture,
             audio::stop_capture,
+            audio::list_audio_sessions,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
