@@ -7,7 +7,7 @@ Inspired by the old Windows Media Player visualizers (especially WhiteCap), but 
 ## Features
 
 - **System-wide *or* per-app audio capture** via Windows WASAPI loopback. Pick "System (all audio)" to visualize everything, or pick a specific app (Spotify, Chrome, Discord, etc.) to react only to that app's output.
-- **3D audio-reactive visualizer** — a spectrum-driven spike ball rendered in WebGL2. 600 rays radiate in 3D, each ray's length tied to one frequency bin. Bass kicks make the whole ball "breathe" outward; treble drives sparkle; the camera slowly orbits.
+- **Five visualizer presets** — switch between Spike (3D spectrum-ball), Canyon (synthwave flythrough over scrolling terrain with a deep U-shape and lateral camera sweep), Tunnel (180 rings receding to infinity, with beats indenting the surface and spreading across rings), Wave (current spectrum line cloned into a vertical stack of fading copies), and Bars (radial 3D equalizer). Each preset has tuned camera + audio mapping.
 - **Now Playing overlay** — pulls track title, artist, album, art, and progress from Windows SMTC. Follows the source picker — picking Spotify shows Spotify's track; picking Chrome shows the Chrome tab's title.
 - **Real-time spectrum analysis** — 1024-point FFT at 48 kHz, ~90 frames/second updates.
 - **Small footprint** — ~10 MB executable, Tauri-based (Rust backend + Svelte frontend + Edge WebView2).
@@ -88,8 +88,9 @@ npm run tauri build    # produce installers in src-tauri/target/release/bundle/
 
 - **v0.1** — system-wide audio capture + spike-ball visualizer.
 - **v0.2** — per-app audio picker via `IAudioClient`'s per-process loopback mode.
-- **v0.3** *(current)* — Now Playing overlay via SMTC, coupled to the source picker.
-- *Future ideas* — multiple visualizer presets (preset cycler in the HUD), palette customization, fullscreen-on-launch flag, beat-synced preset transitions.
+- **v0.3** — Now Playing overlay via SMTC, coupled to the source picker.
+- **v0.4** *(current)* — five visualizer presets (Spike / Canyon / Tunnel / Wave / Bars) with per-preset camera tuning, audio reactivity, and palette behavior. Preset choice persists in localStorage.
+- *Future ideas* — backgrounds, palette customization, fullscreen-on-launch flag, beat-synced preset transitions.
 
 ## License
 

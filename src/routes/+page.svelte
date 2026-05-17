@@ -40,6 +40,24 @@
   let sourceOpen = $state(false);
   let sourceDdEl: HTMLDivElement | undefined;
 
+  // Visualizer preset picker.
+  type PresetName = "spike" | "canyon" | "tunnel" | "wave" | "bars";
+  const PRESETS: PresetName[] = ["spike", "canyon", "tunnel", "wave", "bars"];
+  const PRESET_LABELS: Record<PresetName, string> = {
+    spike: "Spike",
+    canyon: "Canyon",
+    tunnel: "Tunnel",
+    wave: "Wave",
+    bars: "Bars",
+  };
+  const LS_PRESET = "wmp-modern.preset";
+  let preset = $state<PresetName>("spike");
+
+  function setPreset(p: PresetName) {
+    preset = p;
+    try { localStorage.setItem(LS_PRESET, p); } catch {}
+  }
+
   const LS_KEY = "wmp-modern.selectedPid";
 
   // ─── Now Playing (SMTC) ───────────────────────────────────────────
@@ -62,6 +80,12 @@
   let npObservedAt = 0;
   let npPollTimer: number | undefined;
   let displayPos = $state(0);
+  // Track-change auto-show: when the title/artist changes, pop the Now Playing card
+  // up for NP_FLASH_MS even if the HUD is otherwise hidden.
+  let lastTrackKey = "";
+  let npShownUntil = 0;
+  let npFlashActive = $state(false); // toggled in the render loop so reactivity fires
+  const NP_FLASH_MS = 5000;
 
   onMount(async () => {
     try { initGL(canvasEl); } catch (e) { error = String(e); return; }
@@ -70,6 +94,12 @@
     // Restore last source choice (if any) from localStorage.
     const stored = localStorage.getItem(LS_KEY);
     selectedPid = stored !== null && stored !== "" ? Number(stored) : null;
+
+    // Restore last preset choice.
+    const storedPreset = localStorage.getItem(LS_PRESET) as PresetName | null;
+    if (storedPreset && PRESETS.includes(storedPreset)) {
+      preset = storedPreset;
+    }
 
     await refreshSessions();
     await startWithSelected();
@@ -153,11 +183,19 @@
     try {
       const snap = await invoke<NowPlayingSnapshot>("get_now_playing");
       if (snap.current && (snap.current.title || snap.current.artist)) {
+        const newKey = `${snap.current.title}\x1f${snap.current.artist}`;
+        // Trigger flash only on real changes, and only after we've established a baseline
+        // — otherwise the very first poll after launch would always flash.
+        if (lastTrackKey !== "" && newKey !== lastTrackKey) {
+          npShownUntil = performance.now() + NP_FLASH_MS;
+        }
+        lastTrackKey = newKey;
         nowPlaying = snap.current;
         npObservedAt = performance.now();
         displayPos = snap.current.position_ms;
       } else {
         nowPlaying = null;
+        lastTrackKey = "";
       }
     } catch {
       nowPlaying = null;
@@ -227,8 +265,19 @@
     return prev * alpha + next * (1 - alpha);
   }
 
+  // Mousemove fires many times per second; throttle to avoid spamming Svelte
+  // reactivity (which can cause perceptible stutter in the visualizer).
+  let lastBumpAt = 0;
   function bumpHud() {
-    showHud = true;
+    const now = performance.now();
+    if (now - lastBumpAt < 120 && showHud) {
+      // Still active and timer already set — just reset the timeout, don't toggle state.
+      if (hudTimer) clearTimeout(hudTimer);
+      hudTimer = window.setTimeout(() => { showHud = false; }, 3000);
+      return;
+    }
+    lastBumpAt = now;
+    if (!showHud) showHud = true;
     if (hudTimer) clearTimeout(hudTimer);
     hudTimer = window.setTimeout(() => { showHud = false; }, 3000);
   }
@@ -294,9 +343,86 @@
   const starP     = new Float32Array(K_STARS * 3);
   const starC     = new Float32Array(K_STARS * 3);
 
+  // Canyon Chase preset: scrolling 3D wireframe terrain. Heightmap of past
+  // spectrum frames, new row written at the far end (horizon) and shifted
+  // toward the camera each tick — classic synthwave forward-flythrough.
+  const CANYON_COLS = 96;
+  const CANYON_ROWS = 72;          // more rows so the deeper canyon stays detailed
+  const CANYON_WIDTH = 16.0;       // broader U
+  const CANYON_DEPTH = 25.0;       // much longer into the distance
+  const CANYON_HEIGHT = 0.95;
+  const CANYON_WALL_HEIGHT = 5.5;
+  const canyonHeightmap = new Float32Array(CANYON_COLS * CANYON_ROWS);
+  const canyonBaseline = new Float32Array(CANYON_COLS);
+  // Sharper U: exponent 5.0 → walls hug the outer ~15% with a nearly flat floor.
+  for (let c = 0; c < CANYON_COLS; c++) {
+    const u = c / (CANYON_COLS - 1);
+    const dist = Math.abs(u - 0.5) * 2;
+    canyonBaseline[c] = Math.pow(dist, 5.0) * CANYON_WALL_HEIGHT;
+  }
+  // Geometry: horizontal lines (cols-1 per row × rows) + vertical lines (rows-1 per col × cols).
+  const CANYON_HORZ_SEG = (CANYON_COLS - 1) * CANYON_ROWS;
+  const CANYON_VERT_SEG = (CANYON_ROWS - 1) * CANYON_COLS;
+  const CANYON_TOTAL_SEG = CANYON_HORZ_SEG + CANYON_VERT_SEG;
+  const canyonP = new Float32Array(CANYON_TOTAL_SEG * 2 * 3);
+  const canyonC = new Float32Array(CANYON_TOTAL_SEG * 2 * 3);
+  let canyonScrollAccumulator = 0;
+
+  // Wave preset: compact object, lines stacked in Y, orbited by the camera.
+  const WAVE_N = 256;
+  const WAVE_CLONES = 30;              // more clones — stack extends further down
+  const WAVE_WIDTH = 3.6;              // narrower
+  const WAVE_HEIGHT = 0.28;
+  const WAVE_LINE_SPACING_Y = 0.075;
+  const WAVE_TOTAL_VERTS = WAVE_CLONES * WAVE_N;
+  const waveAllP = new Float32Array(WAVE_TOTAL_VERTS * 3);
+  const waveAllC = new Float32Array(WAVE_TOTAL_VERTS * 3);
+  const waveLine = new Float32Array(WAVE_N);
+  const waveLineTmp = new Float32Array(WAVE_N);
+
+  // Tunnel preset: same scrolling-heightmap idea as the canyon, but the spectrum
+  // wraps angularly around each ring instead of laying flat across an X-axis.
+  // - "Rows" are rings, spaced along Z.
+  // - "Columns" are vertices around each ring's circumference (an angle).
+  // - The heightmap cell at (ring, angle) is a radial displacement: bigger = the
+  //   ring bulges outward at that angle.
+  // Each frame the heightmap shifts one row toward the camera and we write the
+  // current spectrum into the far ring, exactly like the canyon. Result: spectrum
+  // history flying toward the viewer in tunnel form.
+  const TUNNEL_RINGS = 180;       // very dense — rings nearly touch
+  const TUNNEL_RING_N = 64;
+  const TUNNEL_DEPTH = 32.0;
+  const TUNNEL_BASE_R = 1.10;
+  const TUNNEL_AMP = 0.35;        // beat indents the surface inward
+  const TUNNEL_MIN_R = 0.30;      // clamp to keep the core visible even on strong beats
+  const TUNNEL_TOTAL_VERTS = TUNNEL_RINGS * TUNNEL_RING_N;
+  const tunnelHeightmap = new Float32Array(TUNNEL_RINGS * TUNNEL_RING_N);
+  const tunnelRowBuf = new Float32Array(TUNNEL_RING_N);
+  const tunnelRowTmp = new Float32Array(TUNNEL_RING_N);
+  // One big buffer for ALL rings — uploaded once per frame, drawn as 28 separate
+  // LINE_LOOPs (offsets into the same buffer) + a single POINTS draw for the glow.
+  const tunnelAllP = new Float32Array(TUNNEL_TOTAL_VERTS * 3);
+  const tunnelAllC = new Float32Array(TUNNEL_TOTAL_VERTS * 3);
+  let tunnelScrollAccumulator = 0;
+
+  // Bars preset: 64 radial 3D bars, mirrored above/below the plane.
+  const BARS_N = 64;
+  // Each bar = 2 line segments (positive Y half + negative Y half) = 4 vertices total.
+  const barsP = new Float32Array(BARS_N * 4 * 3);
+  const barsC = new Float32Array(BARS_N * 4 * 3);
+  // Halo ring (the circle the bars stand on) — line loop of HALO_N verts.
+  const HALO_N = 96;
+  const haloP = new Float32Array(HALO_N * 3);
+  const haloC = new Float32Array(HALO_N * 3);
+
   let rayPVbo: WebGLBuffer, rayCVbo: WebGLBuffer;
   let tipPVbo: WebGLBuffer, tipCVbo: WebGLBuffer;
   let starPVbo: WebGLBuffer, starCVbo: WebGLBuffer;
+  let canyonPVbo: WebGLBuffer, canyonCVbo: WebGLBuffer;
+  let tunnelRingPVbo: WebGLBuffer, tunnelRingCVbo: WebGLBuffer;
+  let wavePVbo: WebGLBuffer, waveCVbo: WebGLBuffer;
+  let barsPVbo: WebGLBuffer, barsCVbo: WebGLBuffer;
+  let haloPVbo: WebGLBuffer, haloCVbo: WebGLBuffer;
   let quadVbo: WebGLBuffer;
   let lineVao: WebGLVertexArrayObject;
   let quadVao: WebGLVertexArrayObject;
@@ -341,6 +467,17 @@
     tipCVbo  = gl.createBuffer()!;
     starPVbo = gl.createBuffer()!;
     starCVbo = gl.createBuffer()!;
+    canyonPVbo = gl.createBuffer()!;
+    canyonCVbo = gl.createBuffer()!;
+    tunnelRingPVbo   = gl.createBuffer()!;
+    tunnelRingCVbo   = gl.createBuffer()!;
+    wavePVbo = gl.createBuffer()!;
+    waveCVbo = gl.createBuffer()!;
+
+    barsPVbo   = gl.createBuffer()!;
+    barsCVbo   = gl.createBuffer()!;
+    haloPVbo   = gl.createBuffer()!;
+    haloCVbo   = gl.createBuffer()!;
 
     lineVao = gl.createVertexArray()!;
     quadVao = gl.createVertexArray()!;
@@ -451,9 +588,9 @@
     const ROT_Y = t * 0.18;
     const cosY = Math.cos(ROT_Y), sinY = Math.sin(ROT_Y);
 
-    const innerR = 0.15 + audio.bass * 0.08;
-    const baseLen = 1.05 + kickEnv * 0.45;    // ball "breathes" with bass kicks
-    const lenScale = 1.3;
+    const innerR = 0.15 + audio.bass * 0.02;
+    const baseLen = 1.05 + kickEnv * 0.06;    // very gentle bass breathing
+    const lenScale = 0.85;                     // shorter rays overall
     const hueDrift = t * 0.012;
 
     for (let i = 0; i < M_RAYS; i++) {
@@ -499,6 +636,378 @@
       tipC[i * 3 + 0] = Math.min(1, rayC[b6 + 3] * 1.4);
       tipC[i * 3 + 1] = Math.min(1, rayC[b6 + 4] * 1.4);
       tipC[i * 3 + 2] = Math.min(1, rayC[b6 + 5] * 1.4);
+    }
+  }
+
+  // Map a canyon column index to a spectrum bin index using log-spaced bins, so the
+  // perceptual frequency distribution looks balanced across the terrain instead of
+  // all the energy bunching up on one side.
+  function canyonColToBin(col: number): number {
+    const u = col / (CANYON_COLS - 1);
+    const lo = 1, hi = 200;
+    return Math.min(N - 1, Math.max(1, Math.round(Math.pow(hi / lo, u) * lo)));
+  }
+
+  // Same log-spaced mapping for the tunnel, but wraps angularly: vertex 0 starts
+  // at the same bin as vertex TUNNEL_RING_N (the loop closes) — so we go halfway
+  // around the spectrum and mirror, otherwise the seam would be visible.
+  function tunnelVertToBin(v: number): number {
+    // Map [0, 1) angular position to [0, 1] frequency by folding at 0.5.
+    const u = v / TUNNEL_RING_N;
+    const folded = u < 0.5 ? u * 2 : (1 - u) * 2;  // 0..1..0 (continuous at the seam)
+    const lo = 1, hi = 180;
+    return Math.min(N - 1, Math.max(1, Math.round(Math.pow(hi / lo, folded) * lo)));
+  }
+
+  function advanceTunnelHeightmap(dt: number) {
+    // Faster base scroll; bass kicks still significantly accelerate it.
+    tunnelScrollAccumulator += dt * 14 + kickEnv * 6 * dt;
+    while (tunnelScrollAccumulator >= 1) {
+      tunnelScrollAccumulator -= 1;
+      // Shift rings FORWARD (toward the camera): ring[r] = ring[r+1].
+      for (let r = 0; r < TUNNEL_RINGS - 1; r++) {
+        const dst = r * TUNNEL_RING_N;
+        const src = (r + 1) * TUNNEL_RING_N;
+        for (let v = 0; v < TUNNEL_RING_N; v++) {
+          tunnelHeightmap[dst + v] = tunnelHeightmap[src + v];
+        }
+      }
+      // Write new spectrum into the FAR ring. Two passes of 1-2-1 blur, but
+      // circular at the seam (wrap around) so the ring is smooth all the way
+      // around its circumference.
+      // Beat amplifier — strong, then we lightly diffuse longitudinally so the
+      // peaks spread to neighbors without flattening completely.
+      const beatBoost = 2.0 + kickEnv * 3.5;
+      for (let v = 0; v < TUNNEL_RING_N; v++) {
+        const b = bins[tunnelVertToBin(v)];
+        tunnelRowBuf[v] = Math.sqrt(Math.max(0, b)) * beatBoost;
+      }
+      // Only ONE circular smoothing pass so distinct peaks remain visible
+      // around the ring — multiple small prominent mounds rather than one big blob.
+      for (let v = 0; v < TUNNEL_RING_N; v++) {
+        const vm = (v - 1 + TUNNEL_RING_N) % TUNNEL_RING_N;
+        const vp = (v + 1) % TUNNEL_RING_N;
+        tunnelRowTmp[v] = (tunnelRowBuf[vm] + 2 * tunnelRowBuf[v] + tunnelRowBuf[vp]) * 0.25;
+      }
+      for (let v = 0; v < TUNNEL_RING_N; v++) tunnelRowBuf[v] = tunnelRowTmp[v];
+      // Cross-fade with the previous-far-ring for vertical continuity.
+      const farRow = (TUNNEL_RINGS - 1) * TUNNEL_RING_N;
+      for (let v = 0; v < TUNNEL_RING_N; v++) {
+        const prev = tunnelHeightmap[farRow + v];
+        tunnelHeightmap[farRow + v] = prev * 0.30 + tunnelRowBuf[v] * 0.70;
+      }
+
+      // Longitudinal blur — VERY light, just enough that each beat's bump
+      // visibly spans 3-5 adjacent rings while still preserving most of the
+      // peak amplitude per ring (was 0.25/0.50/0.25; now 0.10/0.80/0.10).
+      for (let v = 0; v < TUNNEL_RING_N; v++) {
+        let prev = tunnelHeightmap[v];
+        for (let r = 1; r < TUNNEL_RINGS - 1; r++) {
+          const idx = r * TUNNEL_RING_N + v;
+          const curr = tunnelHeightmap[idx];
+          const next = tunnelHeightmap[idx + TUNNEL_RING_N];
+          tunnelHeightmap[idx] = prev * 0.10 + curr * 0.80 + next * 0.10;
+          prev = curr;
+        }
+      }
+    }
+  }
+
+  // ─── Wave preset: 2D spectrum line ──────────────────────────────
+  // Single horizontal line. Y at each X is driven by a spectrum bin (log-spaced).
+  // The whole line scales vertically with bass kicks → it "rises" on every beat.
+  function waveColToBin(c: number): number {
+    const u = c / (WAVE_N - 1);
+    const lo = 1, hi = 200;
+    return Math.min(N - 1, Math.max(1, Math.round(Math.pow(hi / lo, u) * lo)));
+  }
+
+  function buildWave(t: number) {
+    const beatBoost = 1.0 + kickEnv * 2.5;
+    const hueDrift = t * 0.04;
+
+    // Compute the one current spectrum line (smoothed).
+    for (let i = 0; i < WAVE_N; i++) {
+      const b = bins[waveColToBin(i)];
+      waveLine[i] = Math.sqrt(Math.max(0, b)) * 1.6 * beatBoost;
+    }
+    for (let pass = 0; pass < 2; pass++) {
+      for (let i = 0; i < WAVE_N; i++) {
+        const im = Math.max(0, i - 1);
+        const ip = Math.min(WAVE_N - 1, i + 1);
+        waveLineTmp[i] = (waveLine[im] + 2 * waveLine[i] + waveLine[ip]) * 0.25;
+      }
+      for (let i = 0; i < WAVE_N; i++) waveLine[i] = waveLineTmp[i];
+    }
+
+    // Clone the current line into WAVE_CLONES stacked copies, centered on Y=0,
+    // all at Z=0 (no depth stagger).
+    const halfSpanY = (WAVE_CLONES - 1) * WAVE_LINE_SPACING_Y * 0.5;
+    for (let r = 0; r < WAVE_CLONES; r++) {
+      const baseY = halfSpanY - r * WAVE_LINE_SPACING_Y;
+      const baseZ = 0;
+      const ageT = r / (WAVE_CLONES - 1);
+      const fade = 1 - ageT;
+      const fadeQ = fade * fade * 0.85 + 0.15; // small floor so all clones remain dimly visible
+
+      // Each line is one solid color — slowly drifts over time, subtle offset
+      // per clone so adjacent lines are slightly different shades.
+      const cloneU = r / (WAVE_CLONES - 1);
+      const lineHue = hueDrift + cloneU * 0.10;
+      for (let i = 0; i < WAVE_N; i++) {
+        const u = i / (WAVE_N - 1);
+        const x = (u - 0.5) * WAVE_WIDTH;
+        const h = waveLine[i] * WAVE_HEIGHT;
+        const idx = (r * WAVE_N + i) * 3;
+        waveAllP[idx + 0] = x;
+        waveAllP[idx + 1] = baseY + h;
+        waveAllP[idx + 2] = baseZ;
+        pal(lineHue, waveAllC, idx);
+        const peakBoost = 0.55 + h * 0.85;
+        const brightness = fadeQ * peakBoost;
+        waveAllC[idx + 0] *= brightness;
+        waveAllC[idx + 1] *= brightness;
+        waveAllC[idx + 2] *= brightness;
+      }
+    }
+  }
+
+  function buildTunnel(t: number, dt: number) {
+    advanceTunnelHeightmap(dt);
+    const hueBase = t * 0.04;
+    const zStep = TUNNEL_DEPTH / (TUNNEL_RINGS - 1);
+    const subRow = tunnelScrollAccumulator;
+    const zOffset = subRow * zStep; // positive: rings slide toward camera
+
+    for (let r = 0; r < TUNNEL_RINGS; r++) {
+      const z = -r * zStep + zOffset;
+      const depthT = 1 - r / (TUNNEL_RINGS - 1);
+      // Cubic falloff so the far end vanishes near-completely; close rings stay bright.
+      const depthFade = 0.005 + depthT * depthT * depthT * 0.995;
+      const ringHueShift = r * 0.025;
+      for (let v = 0; v < TUNNEL_RING_N; v++) {
+        const u = v / TUNNEL_RING_N;
+        const angle = u * Math.PI * 2;
+        const height = tunnelHeightmap[r * TUNNEL_RING_N + v];
+        // Beats push INWARD (indent the surface). Clamp so radius can't collapse to 0.
+        const radius = Math.max(TUNNEL_MIN_R, TUNNEL_BASE_R - height * TUNNEL_AMP);
+        const idx = (r * TUNNEL_RING_N + v) * 3;
+        tunnelAllP[idx + 0] = Math.cos(angle) * radius;
+        tunnelAllP[idx + 1] = Math.sin(angle) * radius;
+        tunnelAllP[idx + 2] = z;
+
+        // Rainbow around the ring + slow time drift + ring-depth hue shift.
+        pal(u + hueBase + ringHueShift, tunnelAllC, idx);
+        // Brighter on peaks.
+        const peakBoost = 0.55 + height * 0.85;
+        const brightness = depthFade * peakBoost;
+        tunnelAllC[idx + 0] *= brightness;
+        tunnelAllC[idx + 1] *= brightness;
+        tunnelAllC[idx + 2] *= brightness;
+      }
+    }
+  }
+
+  function advanceCanyonHeightmap(dt: number) {
+    // Faster scroll for a snappier flythrough sensation.
+    canyonScrollAccumulator += dt * 28 + kickEnv * 6 * dt;
+    while (canyonScrollAccumulator >= 1) {
+      canyonScrollAccumulator -= 1;
+      for (let r = 0; r < CANYON_ROWS - 1; r++) {
+        const dst = r * CANYON_COLS;
+        const src = (r + 1) * CANYON_COLS;
+        for (let c = 0; c < CANYON_COLS; c++) {
+          canyonHeightmap[dst + c] = canyonHeightmap[src + c];
+        }
+      }
+      // Write new spectrum row. Boost the input gain and use only 2 smoothing passes
+      // so peaks stay tall and dramatic instead of being smoothed flat.
+      const farRow = (CANYON_ROWS - 1) * CANYON_COLS;
+      let buf: Float32Array = new Float32Array(CANYON_COLS);
+      let tmp: Float32Array = new Float32Array(CANYON_COLS);
+      for (let c = 0; c < CANYON_COLS; c++) {
+        const b = bins[canyonColToBin(c)];
+        buf[c] = Math.sqrt(Math.max(0, b)) * 2.8; // boosted from 1.8
+      }
+      for (let pass = 0; pass < 2; pass++) {
+        for (let c = 0; c < CANYON_COLS; c++) {
+          const cm = Math.max(0, c - 1);
+          const cp = Math.min(CANYON_COLS - 1, c + 1);
+          tmp[c] = (buf[cm] + 2 * buf[c] + buf[cp]) * 0.25;
+        }
+        [buf, tmp] = [tmp, buf];
+      }
+      // Cross-fade lightly with previous-far-row for vertical continuity.
+      for (let c = 0; c < CANYON_COLS; c++) {
+        const prev = canyonHeightmap[farRow + c];
+        canyonHeightmap[farRow + c] = prev * 0.30 + buf[c] * 0.70;
+      }
+    }
+  }
+
+  // Helper: write a vertex (position + color) into the canyon buffers at given segment offset.
+  function setCanyonVertex(segIdx: number, vertInSeg: 0 | 1, x: number, y: number, z: number, hueT: number, brightness: number) {
+    const i = (segIdx * 2 + vertInSeg) * 3;
+    canyonP[i + 0] = x;
+    canyonP[i + 1] = y;
+    canyonP[i + 2] = z;
+    pal(hueT, canyonC, i);
+    canyonC[i + 0] *= brightness;
+    canyonC[i + 1] *= brightness;
+    canyonC[i + 2] *= brightness;
+  }
+
+  function buildCanyon(t: number, dt: number) {
+    advanceCanyonHeightmap(dt);
+    const hueBase = t * 0.04;
+
+    const xStep = CANYON_WIDTH / (CANYON_COLS - 1);
+    const zStep = CANYON_DEPTH / (CANYON_ROWS - 1);
+
+    // Sub-row interpolation: as the accumulator grows from 0→1, every row
+    // smoothly slides toward the camera (+Z direction). When it wraps to 0,
+    // the discrete shift has already moved every row's data one slot forward,
+    // so the apparent position is continuous.
+    const subRow = canyonScrollAccumulator;
+    const zOffset = subRow * zStep;
+
+    let seg = 0;
+
+    // Horizontal lines (col → col+1 within each row).
+    for (let r = 0; r < CANYON_ROWS; r++) {
+      const z = -r * zStep + zOffset;
+      const depthT = 1 - r / (CANYON_ROWS - 1);
+      // Quadratic depth falloff so far rows fade nearly to black at the horizon.
+      const depthFade = 0.02 + depthT * depthT * 0.98;
+      for (let c = 0; c < CANYON_COLS - 1; c++) {
+        const h0 = canyonHeightmap[r * CANYON_COLS + c] * CANYON_HEIGHT + canyonBaseline[c];
+        const h1 = canyonHeightmap[r * CANYON_COLS + (c + 1)] * CANYON_HEIGHT + canyonBaseline[c + 1];
+        const x0 = (c / (CANYON_COLS - 1) - 0.5) * CANYON_WIDTH;
+        const x1 = ((c + 1) / (CANYON_COLS - 1) - 0.5) * CANYON_WIDTH;
+        const b0 = depthFade * (0.5 + h0 * 1.0);
+        const b1 = depthFade * (0.5 + h1 * 1.0);
+        setCanyonVertex(seg, 0, x0, h0, z, hueBase + h0 * 0.2, b0);
+        setCanyonVertex(seg, 1, x1, h1, z, hueBase + h1 * 0.2, b1);
+        seg++;
+      }
+    }
+
+    // Vertical lines (row → row+1 within each col).
+    for (let c = 0; c < CANYON_COLS; c++) {
+      const x = (c / (CANYON_COLS - 1) - 0.5) * CANYON_WIDTH;
+      for (let r = 0; r < CANYON_ROWS - 1; r++) {
+        const z0 = -r * zStep + zOffset;
+        const z1 = -(r + 1) * zStep + zOffset;
+        const depthT0 = 1 - r / (CANYON_ROWS - 1);
+        const depthT1 = 1 - (r + 1) / (CANYON_ROWS - 1);
+        const fade0 = 0.02 + depthT0 * depthT0 * 0.98;
+        const fade1 = 0.02 + depthT1 * depthT1 * 0.98;
+        const h0 = canyonHeightmap[r * CANYON_COLS + c] * CANYON_HEIGHT + canyonBaseline[c];
+        const h1 = canyonHeightmap[(r + 1) * CANYON_COLS + c] * CANYON_HEIGHT + canyonBaseline[c];
+        const b0 = fade0 * (0.5 + h0 * 1.0);
+        const b1 = fade1 * (0.5 + h1 * 1.0);
+        setCanyonVertex(seg, 0, x, h0, z0, hueBase + h0 * 0.2, b0);
+        setCanyonVertex(seg, 1, x, h1, z1, hueBase + h1 * 0.2, b1);
+        seg++;
+      }
+    }
+  }
+
+  // ─── Tunnel preset: 3D forward-flight ─────────────────────────────
+  function advanceTunnel(dt: number) {
+    const baseSpeed = 1.8;
+    const speed = baseSpeed + kickEnv * 5.0;
+    for (let i = 0; i < TUNNEL_RING_COUNT; i++) {
+      tunnelRingZ[i] += dt * speed;
+      if (tunnelRingZ[i] > 1.5) {
+        // Recycle to the far end.
+        tunnelRingZ[i] -= TUNNEL_RING_COUNT * TUNNEL_RING_SPACING;
+        tunnelRingPhase[i] = Math.random() * Math.PI * 2;
+        tunnelRingHue[i] = Math.random();
+      }
+    }
+  }
+
+  function buildTunnelRing(idx: number, t: number) {
+    const z = tunnelRingZ[idx];
+    const phase = tunnelRingPhase[idx];
+    const hueBase = tunnelRingHue[idx];
+
+    // Slightly smaller base radius so rings fit comfortably in the FOV.
+    const baseR = 1.05;
+    const waveScale = 0.10;
+    const hueDrift = t * 0.04;
+
+    // Depth fade — higher floor so even far rings are visible.
+    const camZ = 1.5;
+    const tunnelEnd = -TUNNEL_RING_COUNT * TUNNEL_RING_SPACING;
+    const depthT = Math.max(0, Math.min(1, (z - tunnelEnd) / (camZ - tunnelEnd)));
+    const depthFade = 0.30 + depthT * 0.70;
+
+    for (let i = 0; i < TUNNEL_RING_N; i++) {
+      const u = i / TUNNEL_RING_N;
+      const angle = u * Math.PI * 2 + phase + t * 0.10;
+      const w = wave.length > 0 ? (wave[Math.floor(u * wave.length)] || 0) : 0;
+      const wobble = Math.sin(angle * 6 + t * 0.5) * 0.045;
+      const r = baseR + w * waveScale + wobble + audio.bass * 0.05;
+      tunnelRingP[i * 3 + 0] = Math.cos(angle) * r;
+      tunnelRingP[i * 3 + 1] = Math.sin(angle) * r;
+      tunnelRingP[i * 3 + 2] = z;
+      pal(u * 0.10 + hueBase + hueDrift, tunnelRingC, i * 3);
+      tunnelRingC[i * 3 + 0] *= depthFade;
+      tunnelRingC[i * 3 + 1] *= depthFade;
+      tunnelRingC[i * 3 + 2] *= depthFade;
+    }
+  }
+
+  function buildBars(t: number) {
+    const innerR = 0.85 + kickEnv * 0.10;
+    const heightScale = 1.3;
+    const spinT = t * 0.10;
+    const hueDrift = t * 0.012;
+
+    for (let i = 0; i < BARS_N; i++) {
+      const u = i / BARS_N;
+      const angle = u * Math.PI * 2 + spinT;
+      // Sample bins to fill BARS_N entries: take every 4th bin.
+      const binIdx = (i * 4) % N;
+      const h = bins[binIdx] * heightScale;
+
+      const cx = Math.cos(angle), cz = Math.sin(angle);
+      const bx = cx * innerR, bz = cz * innerR;
+
+      const base = i * 12; // 4 verts * 3 components
+
+      // Top-half bar: from (bx, 0, bz) to (bx, +h, bz)
+      barsP[base + 0] = bx;  barsP[base + 1] = 0;  barsP[base + 2] = bz;
+      barsP[base + 3] = bx;  barsP[base + 4] = h;  barsP[base + 5] = bz;
+      // Bottom-half bar: from (bx, 0, bz) to (bx, -h, bz)
+      barsP[base + 6] = bx;  barsP[base + 7] = 0;  barsP[base + 8] = bz;
+      barsP[base + 9] = bx;  barsP[base + 10] = -h; barsP[base + 11] = bz;
+
+      // Color: bright at the tip, dim at the base. Hue varies with angle.
+      const cBase = base; // 4 verts colored independently
+      pal(u + hueDrift, barsC, cBase + 0);     // base of top
+      pal(u + hueDrift, barsC, cBase + 3);     // tip of top (full)
+      pal(u + hueDrift, barsC, cBase + 6);     // base of bottom
+      pal(u + hueDrift, barsC, cBase + 9);     // tip of bottom (full)
+      // Dim the base ends (vert 0 and vert 2)
+      barsC[cBase + 0] *= 0.20; barsC[cBase + 1] *= 0.20; barsC[cBase + 2] *= 0.20;
+      barsC[cBase + 6] *= 0.20; barsC[cBase + 7] *= 0.20; barsC[cBase + 8] *= 0.20;
+    }
+
+    // Halo ring (line loop around the base of all bars)
+    for (let i = 0; i < HALO_N; i++) {
+      const u = i / HALO_N;
+      const a = u * Math.PI * 2 + spinT * 0.5;
+      haloP[i * 3 + 0] = Math.cos(a) * innerR;
+      haloP[i * 3 + 1] = 0;
+      haloP[i * 3 + 2] = Math.sin(a) * innerR;
+      pal(u + hueDrift + 0.5, haloC, i * 3);
+      // Dim the halo so it's a subtle frame, not a focal point.
+      haloC[i * 3 + 0] *= 0.45;
+      haloC[i * 3 + 1] *= 0.45;
+      haloC[i * 3 + 2] *= 0.45;
     }
   }
 
@@ -548,10 +1057,67 @@
   function computeMVP(t: number): number {
     const aspect = canvasEl.width / Math.max(1, canvasEl.height);
     mat4Perspective(proj, (Math.PI / 180) * 55, aspect, 0.1, 100);
-    // Orbital camera around the spiky ball.
-    const orbit = t * 0.06;
-    const tilt = 0.30 + Math.sin(t * 0.05) * 0.08;
-    const dist = 2.5 - kickEnv * 0.5;
+
+    // Canyon and tunnel have fundamentally different camera setups than the
+    // rotating presets, so handle them up front.
+    if (preset === "canyon") {
+      // Faster lateral sweep (~52 sec period). Camera drifts side-to-side, looking
+      // diagonally so the canyon angles across the screen.
+      const period = t * 0.12;
+      const camX = Math.sin(period) * 4.5;
+      const camY = 4.5;
+      const camZ = 2.0;
+      const lookX = -Math.sin(period) * 2.0;
+      mat4LookAt(view, camX, camY, camZ, lookX, -0.30, -12.0);
+      mat4Identity(model);
+      mat4Mul(mvp, proj, view);
+      return camY;
+    }
+    if (preset === "wave") {
+      // Subtle orbit around the wave (~±30°) — since the stack is now flat at z=0,
+      // a wide orbit would show it edge-on and lose all the detail.
+      const swing = Math.sin(t * 0.10) * (Math.PI / 6);
+      const tilt = 0.18 + Math.sin(t * 0.05) * 0.06;
+      const dist = 3.6;
+      const ex = Math.sin(swing) * dist * Math.cos(tilt);
+      const ez = Math.cos(swing) * dist * Math.cos(tilt);
+      const ey = Math.sin(tilt) * dist;
+      mat4LookAt(view, ex, ey, ez, 0, 0, 0);
+      mat4Identity(model);
+      mat4Mul(mvp, proj, view);
+      return ey;
+    }
+    if (preset === "tunnel") {
+      // Camera positioned INSIDE the tunnel so you can't see it ending in front.
+      // It still looks forward down -Z; rings behind the camera get clipped.
+      mat4LookAt(view, 0, 0, -3.0, 0, 0, -20);
+      mat4Identity(model);
+      mat4Mul(mvp, proj, view);
+      return 0;
+    }
+
+    // Orbiting presets (spike, bars).
+    let dist: number, tiltBase: number, orbitRate: number, tiltWobbleRate: number, tiltWobbleAmp: number;
+    switch (preset) {
+      case "bars":
+        dist = 3.0 - kickEnv * 0.4;
+        tiltBase = 0.45;
+        orbitRate = 0.07;
+        tiltWobbleRate = 0.05;
+        tiltWobbleAmp = 0.05;
+        break;
+      case "spike":
+      default:
+        dist = 2.5 - kickEnv * 0.20;
+        tiltBase = 0.30;
+        orbitRate = 0.06;
+        tiltWobbleRate = 0.05;
+        tiltWobbleAmp = 0.08;
+        break;
+    }
+
+    const orbit = t * orbitRate;
+    const tilt = tiltBase + Math.sin(t * tiltWobbleRate) * tiltWobbleAmp;
     const ex = Math.sin(orbit) * dist * Math.cos(tilt);
     const ez = Math.cos(orbit) * dist * Math.cos(tilt);
     const ey = Math.sin(tilt) * dist;
@@ -571,6 +1137,11 @@
     // Kick envelope decay.
     kickEnv *= Math.pow(0.04, dt);
 
+    // Now Playing flash visibility — toggle only when crossing the threshold so we
+    // don't trigger Svelte reactivity 60 times a second.
+    const flashActive = now < npShownUntil;
+    if (flashActive !== npFlashActive) npFlashActive = flashActive;
+
     // Smooth Now Playing position interpolation between polls.
     if (nowPlaying && nowPlaying.status === "playing") {
       const elapsed = now - npObservedAt;
@@ -578,48 +1149,90 @@
       displayPos = Math.min(nowPlaying.duration_ms || extrapolated, extrapolated);
     }
 
-    // Trail fade.
+    // Trail fade — color drifts slowly through hues so the background isn't static.
     gl.bindVertexArray(quadVao);
     gl.useProgram(quadProgram);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     const fadeA = 0.10 + audio.level * 0.05;
-    gl.uniform4f(uQuadColor!, 0.012, 0.012, 0.025, fadeA);
+    const bgPhase = t * 0.05;
+    const bgR = 0.012 + 0.014 * (0.5 + 0.5 * Math.cos(bgPhase));
+    const bgG = 0.012 + 0.014 * (0.5 + 0.5 * Math.cos(bgPhase + 2.094));
+    const bgB = 0.025 + 0.014 * (0.5 + 0.5 * Math.cos(bgPhase + 4.188));
+    gl.uniform4f(uQuadColor!, bgR, bgG, bgB, fadeA);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
     // Geometry.
     const camY = computeMVP(t);
     buildStars(dt, t);
-    buildSphere(t, camY);
 
     gl.bindVertexArray(lineVao);
     gl.useProgram(lineProgram);
     gl.uniformMatrix4fv(uMVP!, false, mvp);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
 
-    // Stars (back).
+    // Background stars are always drawn — they give depth context to every preset.
     gl.uniform1f(uPointSize!, 1.8);
     gl.uniform1f(uIntensity!, 0.7);
     bindLineRing(starPVbo, starCVbo, starP, starC);
     gl.drawArrays(gl.POINTS, 0, K_STARS);
 
-    // Spike ball: rays.
-    gl.uniform1f(uIntensity!, 0.85 + audio.treble * 0.5 + kickEnv * 0.4);
-    bindLineRing(rayPVbo, rayCVbo, rayP, rayC);
-    gl.drawArrays(gl.LINES, 0, M_RAYS * 2);
-
-    // Spike ball: tip points (glowing dots at each ray's end).
-    gl.uniform1f(uPointSize!, 2.5 + kickEnv * 2.0);
-    gl.uniform1f(uIntensity!, 1.1 + kickEnv * 0.6);
-    bindLineRing(tipPVbo, tipCVbo, tipP, tipC);
-    gl.drawArrays(gl.POINTS, 0, M_RAYS);
+    // Per-preset geometry + draws.
+    if (preset === "spike") {
+      buildSphere(t, camY);
+      gl.uniform1f(uIntensity!, 0.85 + audio.treble * 0.5 + kickEnv * 0.4);
+      bindLineRing(rayPVbo, rayCVbo, rayP, rayC);
+      gl.drawArrays(gl.LINES, 0, M_RAYS * 2);
+      gl.uniform1f(uPointSize!, 2.5 + kickEnv * 2.0);
+      gl.uniform1f(uIntensity!, 1.1 + kickEnv * 0.6);
+      bindLineRing(tipPVbo, tipCVbo, tipP, tipC);
+      gl.drawArrays(gl.POINTS, 0, M_RAYS);
+    } else if (preset === "canyon") {
+      buildCanyon(t, dt);
+      gl.uniform1f(uPointSize!, 1.0);
+      gl.uniform1f(uIntensity!, 0.95 + audio.level * 0.30);
+      bindLineRing(canyonPVbo, canyonCVbo, canyonP, canyonC);
+      gl.drawArrays(gl.LINES, 0, CANYON_TOTAL_SEG * 2);
+    } else if (preset === "wave") {
+      buildWave(t);
+      bindLineRing(wavePVbo, waveCVbo, waveAllP, waveAllC);
+      gl.uniform1f(uIntensity!, 1.5 + audio.level * 0.3);
+      for (let r = 0; r < WAVE_CLONES; r++) {
+        gl.drawArrays(gl.LINE_STRIP, r * WAVE_N, WAVE_N);
+      }
+    } else if (preset === "tunnel") {
+      // Heightmap-based tunnel (mirrors the canyon's mechanism). All ring geometry
+      // is computed CPU-side into one big buffer, uploaded once, then drawn as
+      // TUNNEL_RINGS separate LINE_LOOPs plus one POINTS draw for the full glow.
+      buildTunnel(t, dt);
+      bindLineRing(tunnelRingPVbo, tunnelRingCVbo, tunnelAllP, tunnelAllC);
+      // Rings, drawn far-to-near for correct additive layering.
+      gl.uniform1f(uIntensity!, 1.5 + audio.level * 0.3);
+      for (let r = TUNNEL_RINGS - 1; r >= 0; r--) {
+        gl.drawArrays(gl.LINE_LOOP, r * TUNNEL_RING_N, TUNNEL_RING_N);
+      }
+      // Glow points across every ring, one draw call.
+      gl.uniform1f(uPointSize!, 2.5 + kickEnv * 1.5);
+      gl.uniform1f(uIntensity!, 1.8 + kickEnv * 0.4);
+      gl.drawArrays(gl.POINTS, 0, TUNNEL_TOTAL_VERTS);
+    } else if (preset === "bars") {
+      buildBars(t);
+      // Halo (subtle base ring).
+      gl.uniform1f(uIntensity!, 0.45 + audio.level * 0.25);
+      bindLineRing(haloPVbo, haloCVbo, haloP, haloC);
+      gl.drawArrays(gl.LINE_LOOP, 0, HALO_N);
+      // Bars themselves.
+      gl.uniform1f(uIntensity!, 0.9 + audio.mid * 0.5 + kickEnv * 0.4);
+      bindLineRing(barsPVbo, barsCVbo, barsP, barsC);
+      gl.drawArrays(gl.LINES, 0, BARS_N * 4);
+    }
   }
 </script>
 
 <canvas bind:this={canvasEl}></canvas>
 
 {#if nowPlaying && (nowPlaying.title || nowPlaying.artist)}
-  <div class="np" class:hidden={!showHud}>
+  <div class="np" class:hidden={!showHud && !npFlashActive}>
     {#if nowPlaying.thumbnail}
       <img class="np-art" src={nowPlaying.thumbnail} alt="" />
     {:else}
@@ -686,6 +1299,20 @@
     </button>
   </div>
 
+  <div class="preset-row">
+    <span class="label-text">Preset</span>
+    <div class="preset-group">
+      {#each PRESETS as p}
+        <button
+          class="preset-btn"
+          class:active={preset === p}
+          onclick={() => setPreset(p)}>
+          {PRESET_LABELS[p]}
+        </button>
+      {/each}
+    </div>
+  </div>
+
   <div class="controls">
     {#if running}
       <button onclick={stop}>Stop</button>
@@ -705,7 +1332,12 @@
   :global(html) { color-scheme: dark; margin: 0; padding: 0; height: 100%; overflow: hidden; background: #000; }
   :global(body) { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #000; font-family: ui-sans-serif, system-ui, sans-serif; color: #eee; }
 
-  canvas { display: block; position: fixed; inset: 0; width: 100vw; height: 100vh; }
+  canvas {
+    display: block; position: fixed; inset: 0; width: 100vw; height: 100vh;
+    /* Force the OS default cursor — works around an occasional WebView2 quirk where
+       the cursor sprite lingers on the canvas after a fast mouse-leave. */
+    cursor: default;
+  }
 
   .hud {
     position: fixed; top: 1rem; right: 1rem; padding: 0.8rem 1rem;
@@ -749,6 +1381,20 @@
   .source-opt.active { background: rgba(120, 160, 220, 0.22); color: #fff; }
   .source-opt.idle { color: #888; }
   .refresh { padding: 0.25rem 0.55rem; font-size: 0.8rem; }
+
+  .preset-row { display: flex; gap: 0.4rem; align-items: center; margin-bottom: 0.5rem; }
+  .preset-group { display: flex; gap: 0.2rem; flex: 1; }
+  .preset-btn {
+    flex: 1;
+    background: rgba(255,255,255,0.06); color: #ccc; font: inherit; font-size: 0.78rem;
+    border: 1px solid rgba(255,255,255,0.10); border-radius: 4px;
+    padding: 0.25rem 0.3rem; cursor: pointer;
+  }
+  .preset-btn:hover { background: rgba(255,255,255,0.12); color: #fff; }
+  .preset-btn.active {
+    background: rgba(120, 160, 220, 0.22); color: #fff;
+    border-color: rgba(120, 160, 220, 0.45);
+  }
   .controls { display: flex; gap: 0.6rem; align-items: center; }
   button {
     padding: 0.35rem 0.8rem; font: inherit; font-size: 0.85rem;
