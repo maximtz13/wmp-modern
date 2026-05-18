@@ -389,11 +389,11 @@
   // Each frame the heightmap shifts one row toward the camera and we write the
   // current spectrum into the far ring, exactly like the canyon. Result: spectrum
   // history flying toward the viewer in tunnel form.
-  const TUNNEL_RINGS = 180;       // very dense — rings nearly touch
+  const TUNNEL_RINGS = 90;        // halved along with depth so accumulated brightness stays sane
   const TUNNEL_RING_N = 64;
-  const TUNNEL_DEPTH = 32.0;
+  const TUNNEL_DEPTH = 8.0;       // half again — rings spawn even closer
   const TUNNEL_BASE_R = 1.10;
-  const TUNNEL_AMP = 0.35;        // beat indents the surface inward
+  const TUNNEL_AMP = 0.18;        // half — gentler beat indentation
   const TUNNEL_MIN_R = 0.30;      // clamp to keep the core visible even on strong beats
   const TUNNEL_TOTAL_VERTS = TUNNEL_RINGS * TUNNEL_RING_N;
   const tunnelHeightmap = new Float32Array(TUNNEL_RINGS * TUNNEL_RING_N);
@@ -660,8 +660,8 @@
   }
 
   function advanceTunnelHeightmap(dt: number) {
-    // Faster base scroll; bass kicks still significantly accelerate it.
-    tunnelScrollAccumulator += dt * 14 + kickEnv * 6 * dt;
+    // Doubled scroll rate.
+    tunnelScrollAccumulator += dt * 28 + kickEnv * 12 * dt;
     while (tunnelScrollAccumulator >= 1) {
       tunnelScrollAccumulator -= 1;
       // Shift rings FORWARD (toward the camera): ring[r] = ring[r+1].
@@ -781,9 +781,11 @@
 
     for (let r = 0; r < TUNNEL_RINGS; r++) {
       const z = -r * zStep + zOffset;
-      const depthT = 1 - r / (TUNNEL_RINGS - 1);
-      // Cubic falloff so the far end vanishes near-completely; close rings stay bright.
-      const depthFade = 0.005 + depthT * depthT * depthT * 0.995;
+      // Reverse depth fade: rings closest to camera (low r) are dim; rings farthest
+      // (high r, the spawn point) are bright. So rings DRAIN brightness as they
+      // scroll toward you. Close still visible (>30%), not invisible.
+      const proximityT = r / (TUNNEL_RINGS - 1);
+      const depthFade = 0.35 + proximityT * 0.65;
       const ringHueShift = r * 0.025;
       for (let v = 0; v < TUNNEL_RING_N; v++) {
         const u = v / TUNNEL_RING_N;
@@ -797,10 +799,9 @@
         tunnelAllP[idx + 2] = z;
 
         // Rainbow around the ring + slow time drift + ring-depth hue shift.
+        // Uniform brightness across the ring — no peak-driven boost.
+        const brightness = depthFade * 0.50;
         pal(u + hueBase + ringHueShift, tunnelAllC, idx);
-        // Brighter on peaks.
-        const peakBoost = 0.55 + height * 0.85;
-        const brightness = depthFade * peakBoost;
         tunnelAllC[idx + 0] *= brightness;
         tunnelAllC[idx + 1] *= brightness;
         tunnelAllC[idx + 2] *= brightness;
@@ -1088,8 +1089,7 @@
       return ey;
     }
     if (preset === "tunnel") {
-      // Camera positioned INSIDE the tunnel so you can't see it ending in front.
-      // It still looks forward down -Z; rings behind the camera get clipped.
+      // Camera positioned inside the tunnel looking down -Z.
       mat4LookAt(view, 0, 0, -3.0, 0, 0, -20);
       mat4Identity(model);
       mat4Mul(mvp, proj, view);
